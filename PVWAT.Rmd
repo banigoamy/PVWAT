@@ -1,0 +1,376 @@
+---
+title: "**PVWAT NOTEBOOK: DUST-TO-SOILING SIMULATION**"
+author: "Amy Tamunoibinyemiem Banigo, Louise Crochemore"
+output:
+  html_document:
+    df_print: paged
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE, error=FALSE, fig.cap = " ", message=FALSE, warning=FALSE)
+```
+
+------------------------------------------------------------------------
+
+# PVWAT NOTEBOOK
+
+## DUST-TO-SOILING SIMULATION
+
+------------------------------------------------------------------------
+
+### **General Info**
+
+PVWAT (Banigo et al.) allows one to simulate time series of the dust deposition flux on panels, the amount of dust accumulated on panels, and the associated soiling losses, from time series of meteorological variables (precipitation intensities, wind speed) and particulate matter concentrations for different particle classes. In the following, the model is applied for a single location representing a hypothetical solar farm with identical PV panels.
+
+PVWAT consists of three sub-models: a deposition flux model, a dust accumulation model and a soiling loss model. These were specifically chosen for their adaptability to data-scarce regions.
+
+This notebook contains the functions needed to run PVWAT and describes how to simulate dust influx, dust accumulation and soiling losses from meteorological and particulate matter time series at a given location.
+
+------------------------------------------------------------------------
+
+### **1. Required Inputs**
+
+#### Input Time Series
+
+Input data files must contain for each location a list containing 3-hourly time series with dates, wind speed, precipitation, particulate matter concentration for each class of particle. It also contains the characteristic radius $A$ and roughness length $z_0$ that both depend on the land use category at this location.
+
+```{r}
+# Set directory for input time series
+input_dir <- ""
+
+# Set name of .RDS file containing input time series for one location
+point_data_file <- "point_data.rds"
+
+# Set directory for output time series
+output_dir <- input_dir
+  
+```
+
+#### **Location name, Coordinates and Dry season dates**
+
+```{r}
+# Data frame containing the main characteristics about the location where simulation runs
+PVWAT_point <- data.frame(
+  name             = "Location_1",
+  lon              = 0,
+  lat              = 0,
+  stringsAsFactors = FALSE
+)
+
+cat("\nPVWAT point created...\n")
+cat(" Site: ",PVWAT_point$name, 
+    "\n Longitude:",PVWAT_point$lon, 
+    "\n Latitude:",PVWAT_point$lat, "\n")
+
+```
+
+#### **Particulate Matter Concentration Classes**
+
+```{r}
+# PM size classes based on PM data times series used (here, CAMS)
+# Name and labels and mean diameter to consider for each class
+PM_CLASSES <- data.frame(
+  name = c("PM1", "PM2.5-PM1", "PM10-PM2.5", "PM20-PM10"),
+  label = c("PM1 (dp=1µm)", "PM2.5-PM1 (dp=1.75µm)", 
+            "PM10-PM2.5 (dp=8µm)", "PM20-PM10 (dp=15µm)"),
+  dp = c(1e-6, 1.75e-6, 8e-6, 15e-6),
+  stringsAsFactors = FALSE
+)
+```
+
+------------------------------------------------------------------------
+
+### 2. Import time series and parameters
+
+#### **Load atmospheric time series**
+
+```{r}
+# Append input directory and file name 
+input_file = file.path(input_dir,point_data_file)
+ 
+# Check that file exists
+if (!file.exists(input_file)) {
+  stop("point_data.rds not found. 
+       Make sure you specified an input directory and placed the file there.")
+}
+
+# Import file
+point_data <- readRDS(input_file)
+```
+
+#### **Set physical parameters**
+
+```{r}
+kappa   <- 0.41          # von Karman constant
+g       <- 9.81          # acceleration due to gravity
+rhop    <- 2200          # density of aerosol particles
+mu      <- 1.849e-5      # dynamic viscosity of air at 25 degrees C
+v       <- 1.562e-5      # kinematic viscosity of air at 25 degrees C
+k_boltz <- 1.38065e-23   # Boltzmann constant
+h_Vd    <- 10            # reference height set to 10 m for ERA5 data
+```
+
+### 3. Load PVWAT model functions
+
+#### **Cunningham Correction Function**
+
+The Cunningham correction factor is used to account for non--continuum effects when calculating the drag force on small particles.
+
+```{r}
+cunningham_correction <- function(dp) {
+
+  lambda <- 6.73e-8
+  dp_cutoff <- 2.5e-6
+
+  A1 <- 1.257
+  A2 <- 0.4
+  A3 <- 1.1
+
+  Cc <- ifelse(
+    dp >= dp_cutoff,
+    1,
+    1 + (lambda / dp) *
+      (A1 + A2 * exp(-A3 * dp / lambda))
+  )
+
+  return(Cc)
+}
+```
+
+#### **Dust Deposition Velocity Model Function**
+
+The deposition velocity of a particle $V_d(t)$ is estimated by considering gravitational settling, resistance to atmospheric turbulence, and surface resistance and is expressed as:
+
+$V_d(t) = \frac{1}{R_a(t) + R_s(t)} + V_s(t) \cdot \cos\theta$
+
+Where $R_a(t)$ and $R_s(t)$ are the aerodynamic and the surface resistance terms (s/m), $V_s(t)$ is the gravitational settling velocity (m/s) and $\theta$ is the tilt angle of the panel, here assumed equal to the latitude, the suggested optimum inclination for solar panels (Hosseini et al., 2023 ; Sharma et al., 2023).
+
+```{r}
+DepositionVelocityModel <- function(W, Tilt, dp, z0, A, gam, epsilon = 3.0, BSct = 1.0) {
+  
+  # roughness length
+  z0_safe <- pmin(z0, h_Vd * 0.5)
+  
+  # Cunningham correction factor
+  Cc <- cunningham_correction(dp)
+  
+  # Friction velocity
+  u <- abs((kappa * W) / log(h_Vd / z0_safe))
+  
+  # Schmidt number
+  Sc <- v / ((k_boltz * 298.15 * Cc) / (3 * pi * mu * dp))
+  
+  # Gravitational settling velocity
+  Vsf <- (g * rhop * (dp^2) * Cc) / (18 * mu)
+  
+  # Aerodynamic resistance
+  Rat <- (BSct / (kappa * u)) * log(h_Vd / z0_safe)
+  
+  # Surface resistance
+  St <- ((u^2) * Vsf )/ (v * g)
+  Eb <- Sc^(-gam)
+  Eim <- St^2 / (400 + St^2)
+  Ein <- ifelse(is.na(A), 0, pmin(1, 0.5 * (dp / A)^2))
+  R1 <- exp(-sqrt(St))
+  Rb <- 1 / (u * epsilon * (Eb + Eim + Ein) * R1)
+  
+  # Deposition velocity
+  Vd <- (1 / (Rat + Rb) + Vsf * cos(Tilt * pi / 180)) * 100
+  
+  return(Vd)
+}
+```
+
+#### **Dust Accumulation Model Function**
+
+Dust accumulation model relies on the mass balance equation for dust:
+
+$\frac{d \omega(t)}{dt} = i(t) - o_w (t)+o_p (t)$
+
+with $\omega(t)$ the amount of dust accumulated on the panels per unit area (g/m$^{2}$), $i(t)$ the dust deposition flux to the panel, $o_w(t)$ the removal flux due to wind and $o_p(t)$ the removal flux due to precipitation.
+
+Following Besson et al (2017), precipitation is assumed to remove all accumulated dust once precipitation intensity exceeds a threshold $P_0$. For wind removal, we introduce a bulk removal model that assumes that the removal is proportional to the mass of dust accumulated on the panels at time $t$:
+
+$o_{w}(t) = \frac{\omega(t)}{\frac{k}{u^2}}$
+
+with $k$ the wind removal constant and $u$ the wind speed.
+
+```{r}
+AccumulationModel <- function(precip, flux, wind, h, Tr, k_base = 700) {
+  M <- rep(0, length(flux))
+  
+  # Bulk wind removal term
+  k <- k_base / wind^2
+  
+  # Loop on time steps
+  for (i in 1:length(flux)) {
+    
+    # Display state
+    if(i%% 1000 ==0 || i==1) cat('      ',i,'/',length(flux),'\n')
+    
+    # If missing influx of particulate matter or wind speed
+    if (is.na(flux[i]) || is.na(wind[i])) {
+      M[i] <- NA
+      next
+    }
+    # Initialisation and Reinitialisation
+    if (i == 1 || is.na(M[i-1])) {
+      M[i] <- flux[i]
+      next
+    }
+    # Wind or precipitation removal
+    # Conditions for wind removal but no precipitation removal
+    condition1 <- (wind[i] >= 0.000001 && precip[i] < Tr)
+    condition2 <- (wind[i] >= 0.000001 && is.na(precip[i]))
+    if (condition1 || condition2) {
+      M[i] <- M[i-1] * exp(-h/(24 * k)) + k * 24/h * 
+        ((flux[i] + flux[i-1]) / 2) * (1 - exp(-h/(24 * k)))
+    }
+  }
+  return(M)
+}
+```
+
+#### **Soiling Model Function**
+
+Soiling losses are calculated from the amount of dust accumulated on panels. They represent the reduction in PV production efficiency with respect to the efficiency of a clean panel. The function used here is generic, parsimonious and flexible (cf. Banigo et al.):
+
+$SR(t) = (100 - p_1) + p_1 \cdot \exp(p_2 \cdot \omega(t))$
+
+```{r}
+SoilingModel <- function(X, p1 = 67.72, p2 = -0.29) {
+  
+  return((100 - p1) + p1 * exp(p2 * X))
+
+}
+```
+
+------------------------------------------------------------------------
+
+### 4. Load PVWAT simulation function
+
+This function runs the entire PVWAT modelling chain, calling all models : dust deposition, dust accumulation and soiling ratio.
+
+```{r}
+Compute_PVWAT <- function(pm, precip, wind, dates, tilt_angle, z0, A, gamma, Tr, h) {
+  
+  cat("\n#####################################################\n")
+  cat("### SIMULATION START\n")
+  cat("#####################################################\n")
+  
+  # FORCE TO VECTORS
+  wind <- as.vector(wind)
+  precip <- as.vector(precip)
+  
+  # Calculate flux (g/m2/hr) with PM and wind
+  cat("     Calculating dust influx from PM and wind...\n")
+  flux <- rep(0, length(wind))
+  # Cunningham correction table
+  dps_tab <- c(1e-6, 2.5e-6, 1e-5, 2e-5)
+  CCs_tab <- c(1.164, 1.073667, 1.016, 1.008)
+  # Calculate flux for each class of particulate matter
+  for (i in 1:nrow(PM_CLASSES)) {
+    dp_val_i <- PM_CLASSES$dp[i]
+    # ALSO force PM data to vector
+    pm_ts_i <- as.vector(pm[[PM_CLASSES$name[i]]])
+    Vd_ts <- DepositionVelocityModel(wind, tilt_angle, dp_val_i, z0, A, gamma)
+    flux <- flux + (pm_ts_i * Vd_ts * 36000)
+  }
+  
+  # Calculate dust accumulation from dust influx, precipitation and wind
+  cat("     Calculating dust accumulation...\n")
+  k_base <- 700
+  acc <- AccumulationModel(precip, flux, wind, h, Tr, k_base)
+  
+  # Calculate soiling loss from dust accumulation
+  cat("     Calculating soiling loss...\n")
+  soiling <- SoilingModel(acc)
+  
+  cat("\n#####################################################\n")
+  cat("### SIMULATION COMPLETE\n")
+  cat("#####################################################\n")
+  
+  return(data.frame(
+    dates = dates,
+    dust_influx = flux,
+    dust_acc = acc,
+    soiling_ratio = soiling
+  ))
+}
+
+```
+
+------------------------------------------------------------------------
+
+### **5. Run PVWAT**
+
+Here, input time series and parameters are imported, checked and used as input to the PVWAT modelling chain. Resulting simulations of dust influx, dust accumulation and soiling ratio are then checked and exported.
+
+#### PVWAT simulation
+
+```{r}
+h_timestep <- 3
+Tr_ref <- 1 / 8
+
+# Set panel tilt angle to latitude
+Tilt_val <- PVWAT_point$lat
+
+# Location-dependent input dates, time series and parameters
+dates        <- point_data$dates
+wind_ts      <- point_data$wind
+precip_ts    <- point_data$precip
+pm_ts        <- point_data$pm_data_list
+z0_val       <- point_data$z0
+A_val        <- point_data$A
+gamma_val    <- point_data$gamma
+
+# Removing negative wind values
+wind_ts[wind_ts   <= 0] <- NA
+precip_ts[precip_ts <= 0] <- NA
+
+cat(sprintf(
+  "Parameters: z0=%.6f, A=%s, gamma=%s\n",
+  z0_val,
+  ifelse(is.na(A_val), "NA", sprintf("%.6f", A_val)),
+  ifelse(is.na(gamma_val), "NA", sprintf("%.6f", gamma_val))
+))
+
+cat("\nRunning PVWAT...\n\n")
+
+PVWAT_outputs <- Compute_PVWAT(pm = pm_ts, precip = precip_ts, wind = wind_ts, 
+  dates = dates, tilt_angle = Tilt_val, z0 = z0_val, A = A_val,
+  gamma = gamma_val, Tr = Tr_ref, h = h_timestep)
+
+
+```
+
+#### Check PVWAT simulations
+
+```{r}
+# Check outputs
+print(head(PVWAT_outputs))
+
+# Plot output time series for max 3 years
+par(mfrow=c(3,1),las=2)
+N = 3*365*24/h_timestep
+if(nrow(PVWAT_outputs) < N) N = nrow(PVWAT_outputs)
+par(mar=c(1,4,4,2)) ; plot(PVWAT_outputs$dust_influx[1:N],type='l',xaxt='n',
+                           ylab='Dust influx (g/m2/h)')
+abline(v=which(point_data$precip >= Tr_ref,1,0),col='blue',lwd=1)
+par(mar=c(2.5,4,2.5,2)) ; plot(PVWAT_outputs$dust_acc[1:N],type='l',xaxt='n',
+                               ylab='Dust accumulation (g/m2)')
+par(mar=c(4,4,1,2)) ; plot(PVWAT_outputs$soiling_ratio[1:N],type='l',xaxt='n',
+                           ylab='Soiling ratio (%)',xlab='')
+at = which(substr(PVWAT_outputs$dates,6,13)=='01-01')
+axis(1,at=at, labels = substr(PVWAT_outputs$dates[at],1,4))
+```
+
+#### Export PVWAT simulation
+
+```{r}
+# Save results
+output_file <- file.path(output_dir,"PVWAT_results.csv")
+write.csv(PVWAT_outputs, output_file, row.names = FALSE,quote = F)
+```
