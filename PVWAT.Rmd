@@ -170,7 +170,12 @@ DepositionVelocityModel <- function(W, Tilt, dp, z0, A, gam, epsilon = 3.0, BSct
   
   # Surface resistance
   St <- ((u^2) * Vsf )/ (v * g)
-  Eb <- Sc^(-gam)
+  dp_cutoff <- 2.5e-6
+
+  Eb <- ifelse(dp >= dp_cutoff,
+              0,
+              Sc^(-gam))
+
   Eim <- St^2 / (400 + St^2)
   Ein <- ifelse(is.na(A), 0, pmin(1, 0.5 * (dp / A)^2))
   R1 <- exp(-sqrt(St))
